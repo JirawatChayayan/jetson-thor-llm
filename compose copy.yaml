@@ -1,0 +1,269 @@
+name: thor-local-llm
+
+services:
+  vllm:
+    image: ghcr.io/nvidia-ai-iot/vllm:latest-jetson-thor
+    container_name: thor-vllm
+    runtime: nvidia
+    restart: unless-stopped
+    ipc: host
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      HF_HOME: /home/llm_model/.cache/huggingface
+      VLLM_API_KEY: ${VLLM_API_KEY:?Set VLLM_API_KEY in .env}
+    volumes:
+      - /home/llm_model:/home/llm_model
+    command:
+      - vllm
+      - serve
+      - ${MODEL_DIR:-/home/llm_model/Qwen3-8B-quantized.w4a16}
+      - --served-model-name
+      - ${MODEL_NAME:-qwen3-8b}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${VLLM_API_KEY}
+      - --gpu-memory-utilization
+      - "0.75"
+      - --max-model-len
+      - "8192"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_xml
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks: [llmnet]
+
+  # vllm:
+  #     image: vllm/vllm-openai:latest
+  #     container_name: thor-vllm
+  #     restart: unless-stopped
+  #     runtime: nvidia
+  #     environment:
+  #       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+  #       # ปรับแต่ง CUDA/TensorRT ให้เข้ากับสถาปัตยกรรมฮาร์ดแวร์ใหม่
+  #       - TORCH_CUDA_ARCH_LIST="all"
+  #     volumes:
+  #       - ~/.cache/huggingface:/root/.cache/huggingface
+  #       - /home/llm_model:/home/llm_model
+  #     command: 
+  #       - --model=nvidia/Qwen3.6-35B-A3B-NVFP4
+  #       - --served-model-name=${MODEL_NAME:-qwen3-8b}
+  #       - --port=8000
+  #       # ดึงประสิทธิภาพการ์ดจอมาใช้เกือบเต็มพิกัด (Jetson Thor จัดการแรมรวมได้ดี)
+  #       - --gpu-memory-utilization=0.85
+  #       # กำหนดความยาวบริบทที่เหมาะสมเพื่อไม่ให้กินแรมจนเกินไป (ปรับเพิ่ม/ลดได้ตามการใช้งาน)
+  #       - --max-model-len=16384
+  #       # 🚀 ทีเด็ดสำหรับประหยัด VRAM: บีบอัด KV Cache เป็น FP8 เพื่อให้รองรับ User Concurrency ได้สูงขึ้น
+  #       - --kv-cache-dtype=fp8
+  #       # Improve repeated-prompt performance
+  #       - --enable-prefix-caching
+
+  #       # Tool calling
+  #       - --enable-auto-tool-choice
+  #       - --tool-call-parser=${TOOL_CALL_PARSER:-hermes}
+  #     ports:
+  #       - "127.0.0.1:8000:8000"
+  #     networks: [llmnet]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: thor-litellm-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-litellm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-litellm}
+    volumes:
+      - litellm-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [llmnet]
+
+  litellm:
+      image: docker.litellm.ai/berriai/litellm:main-latest
+      container_name: thor-litellm
+      restart: unless-stopped
+      depends_on:
+        vllm:
+          condition: service_started
+        postgres:
+          condition: service_healthy
+      environment:
+        LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in .env}
+        LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?Set LITELLM_SALT_KEY in .env}
+        VLLM_API_KEY: ${VLLM_API_KEY:?Set VLLM_API_KEY in .env}
+        UI_USERNAME: ${UI_USERNAME:-admin}
+        UI_PASSWORD: ${UI_PASSWORD:?Set UI_PASSWORD in .env}
+        DATABASE_URL: postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-litellm}
+        STORE_MODEL_IN_DB: "False"
+        # 👇 สำคัญมาก: ป้องกัน Error เรื่อง API Base ไม่ถูกเซ็ต
+        SEARXNG_API_BASE: http://searxng-core:8080
+      volumes:
+        - ./config/litellm/config.yaml:/app/config.yaml:ro
+      command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+      ports:
+        - "127.0.0.1:4000:4000"
+      networks: [llmnet]
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: thor-open-webui
+    restart: unless-stopped
+    depends_on:
+      - litellm
+    environment:
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
+      WEBUI_AUTH: "true"
+    volumes:
+      - ./data/open-webui:/app/backend/data
+    ports:
+      - "127.0.0.1:3000:8080"
+    networks: [llmnet]
+
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: thor-openclaw
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - litellm
+    environment:
+      HOME: /home/node
+      OPENCLAW_HOME: /home/node
+      OPENCLAW_STATE_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?Set OPENCLAW_GATEWAY_TOKEN in .env}
+      TZ: Asia/Bangkok
+    volumes:
+      - ./config/openclaw:/home/node/.openclaw
+      - ./data/openclaw/workspace:/home/node/.openclaw/workspace
+    ports:
+      - "127.0.0.1:18789:18789"
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    networks: [llmnet]
+
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: thor-hermes
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - litellm
+    command: ["gateway", "run"]
+    environment:
+      LITELLM_API_KEY: ${LITELLM_MASTER_KEY}
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_KEY: ${HERMES_API_SERVER_KEY:?Set HERMES_API_SERVER_KEY in .env}
+      HERMES_DASHBOARD: "1"
+      TZ: Asia/Bangkok
+    volumes:
+      - ./config/hermes:/opt/data
+    ports:
+      - "127.0.0.1:8642:8642"
+      - "127.0.0.1:9119:9119"
+    networks: [llmnet]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: thor-prometheus
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=3d
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [llmnet]
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:latest
+    container_name: thor-cadvisor
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    ports:
+      - "127.0.0.1:8088:8080"
+    networks: [llmnet]
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: thor-grafana
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-this-password}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+    networks: [llmnet]
+
+  searxng-core:
+    container_name: searxng-core
+    image: docker.io/searxng/searxng:${SEARXNG_VERSION:-latest}
+    restart: always
+    ports:
+      - ${SEARXNG_HOST:+${SEARXNG_HOST}:}${SEARXNG_PORT:-8080}:${SEARXNG_PORT:-8080}
+    env_file: ./.env
+    volumes:
+      - ./config/searxng/core-config/:/etc/searxng/:Z
+      - core-data:/var/cache/searxng/
+    networks: [llmnet]
+
+
+  searxng-valkey:
+    container_name: searxng-valkey
+    image: docker.io/valkey/valkey:9-alpine
+    command: valkey-server --save 300 1 --save 60 1000 --loglevel warning
+    restart: always
+    volumes:
+      - valkey-data:/data/
+    networks: [llmnet]
+
+
+
+networks:
+  llmnet:
+    driver: bridge
+
+volumes:
+  litellm-db-data:
+  prometheus-data:
+  grafana-data:
+  core-data:
+  valkey-data:

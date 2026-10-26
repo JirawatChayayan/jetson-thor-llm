@@ -1,0 +1,26 @@
+model_list:
+  - model_name: qwen3-8b
+    litellm_params:
+      model: openai/qwen3-8b
+      api_base: http://vllm:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      
+search_tools:
+  - search_tool_name: searxng-search
+    litellm_params:
+      search_provider: searxng
+      api_base: http://searxng-core:8080
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 300
+  callbacks: ["websearch_interception"]
+  websearch_interception_params:
+    enabled_providers:
+      - openai
+      - hosted_vllm
+    search_tool_name: searxng-search
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  store_model_in_db: false   # match STORE_MODEL_IN_DB="False" in compose
